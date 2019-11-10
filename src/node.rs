@@ -123,16 +123,35 @@ impl Node {
     }
 
     pub(crate) fn split(mut self) -> (Node, Node) {
+        #[derive(Debug)]
+        enum Kind {
+            Normal,
+            LeafBottom,
+            LeafInfinity,
+            IndexBottom,
+            IndexInfinity,
+        }
+
         fn split_inner<T>(
             xs: &mut Vec<(IVec, T)>,
             old_prefix: &[u8],
             old_hi: &[u8],
             suffix_truncation: bool,
+            kind: Kind,
         ) -> (IVec, u8, Vec<(IVec, T)>)
         where
             T: Clone + Ord,
         {
-            let right = xs.split_off(xs.len() / 2 + 1);
+            let split_point = match kind {
+                Kind::Normal => xs.len() / 2 + 1,
+                Kind::LeafBottom => 4,
+                Kind::IndexBottom => 64,
+                Kind::LeafInfinity => xs.len() - 4,
+                Kind::IndexInfinity => xs.len() - 64,
+            };
+
+            let right = xs.split_off(split_point);
+
             let right_min = &right[0].0;
             let left_max = &xs.last().unwrap().0;
 
@@ -192,18 +211,33 @@ impl Node {
             (split_point, u8::try_from(new_prefix_len).unwrap(), right_data)
         }
 
+        let kind =
+            match (self.data.is_leaf(), self.hi.is_empty(), self.lo.is_empty())
+            {
+                (true, true, _) => Kind::LeafInfinity,
+                (true, _, true) => Kind::LeafBottom,
+                (false, true, _) => Kind::IndexInfinity,
+                (false, _, true) => Kind::IndexBottom,
+                _ => Kind::Normal,
+            };
+
         let prefixed_lo = &self.lo[..self.prefix_len as usize];
         let prefixed_hi = &self.hi;
         let (split, right_prefix_len, right_data) = match self.data {
             Data::Index(ref mut pointers) => {
-                let (split, right_prefix_len, right) =
-                    split_inner(pointers, prefixed_lo, prefixed_hi, false);
+                let (split, right_prefix_len, right) = split_inner(
+                    pointers,
+                    prefixed_lo,
+                    prefixed_hi,
+                    false,
+                    kind,
+                );
 
                 (split, right_prefix_len, Data::Index(right))
             }
             Data::Leaf(ref mut items) => {
                 let (split, right_prefix_len, right) =
-                    split_inner(items, prefixed_lo, prefixed_hi, true);
+                    split_inner(items, prefixed_lo, prefixed_hi, true, kind);
 
                 (split, right_prefix_len, Data::Leaf(right))
             }
