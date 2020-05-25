@@ -481,13 +481,37 @@ impl Config {
     }
 
     builder!(
-        (cache_capacity, u64, "maximum size in bytes for the system page cache"),
-        (mode, Mode, "specify whether the system should run in \"small\" or \"fast\" mode"),
+        (
+            cache_capacity,
+            u64,
+            "maximum size in bytes for the system page cache"
+        ),
+        (
+            mode,
+            Mode,
+            "specify whether the system should run in \"small\" or \"fast\" mode"
+        ),
         (use_compression, bool, "whether to use zstd compression"),
-        (compression_factor, i32, "the compression factor to use with zstd compression. Ranges from 1 up to 22. 0 is 'default'. Levels >= 20 are 'ultra'."),
-        (temporary, bool, "deletes the database after drop. if no path is set, uses /dev/shm on linux"),
-        (create_new, bool, "attempts to exclusively open the database, failing if it already exists"),
-        (print_profile_on_drop, bool, "print a performance profile when the Config is dropped")
+        (
+            compression_factor,
+            i32,
+            "the compression factor to use with zstd compression. Ranges from 1 up to 22. 0 is 'default'. Levels >= 20 are 'ultra'."
+        ),
+        (
+            temporary,
+            bool,
+            "deletes the database after drop. if no path is set, uses /dev/shm on linux"
+        ),
+        (
+            create_new,
+            bool,
+            "attempts to exclusively open the database, failing if it already exists"
+        ),
+        (
+            print_profile_on_drop,
+            bool,
+            "print a performance profile when the Config is dropped"
+        )
     );
 
     // panics if config options are outside of advised range
@@ -697,7 +721,7 @@ impl Config {
     /// an asynchronous IO operation.
     #[doc(hidden)]
     pub fn global_error(&self) -> Result<()> {
-        let guard = pin();
+        let guard = crossbeam_epoch::pin();
         let ge = self.global_error.load(SeqCst, &guard);
         if ge.is_null() {
             Ok(())
@@ -711,10 +735,9 @@ impl Config {
     }
 
     pub(crate) fn reset_global_error(&self) {
-        let guard = pin();
+        let guard = crossbeam_epoch::pin();
         let old = self.global_error.swap(Shared::default(), SeqCst, &guard);
         if !old.is_null() {
-            let guard = pin();
             #[allow(unsafe_code)]
             unsafe {
                 guard.defer_destroy(old);
@@ -723,7 +746,7 @@ impl Config {
     }
 
     pub(crate) fn set_global_error(&self, error_value: Error) {
-        let guard = pin();
+        let guard = crossbeam_epoch::pin();
         let error = Owned::new(error_value);
 
         let expected_old = Shared::null();

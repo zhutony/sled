@@ -600,7 +600,7 @@ impl PageCache {
         {
             // subscope required because pc.begin() borrows pc
 
-            let guard = pin();
+            let guard = pc.begin_tx()?;
 
             if let Err(Error::ReportableBug(..)) = pc.get_meta(&guard) {
                 // set up meta
@@ -663,6 +663,15 @@ impl PageCache {
         trace!("pagecache started");
 
         Ok(pc)
+    }
+
+    pub(crate) fn begin_tx(&self) -> Result<Tx> {
+        Ok(Tx {
+            inner: crossbeam_pin(),
+            ts: self.generate_id()?,
+            readset: vec![],
+            writeset: vec![],
+        })
     }
 
     /// Flushes any pending IO buffers to disk to ensure durability.
@@ -742,7 +751,7 @@ impl PageCache {
     /// to GC. Returns an Err if we encountered an IO problem
     /// while performing this GC.
     pub(crate) fn attempt_gc(&self) -> Result<bool> {
-        let guard = pin();
+        let guard = self.begin_tx()?;
         let to_clean = self.log.iobufs.segment_cleaner.pop();
         let ret = if let Some((pid_to_clean, segment_to_clean)) = to_clean {
             self.rewrite_page(pid_to_clean, segment_to_clean, &guard)
@@ -1269,7 +1278,7 @@ impl PageCache {
     }
 
     fn logical_size_of_all_pages(&self) -> Result<u64> {
-        let guard = pin();
+        let guard = self.begin_tx()?;
         let meta_size = self.get_meta(&guard)?.rss();
         let idgen_size = std::mem::size_of::<u64>() as u64;
 
@@ -1629,7 +1638,7 @@ impl PageCache {
             persisted = self.idgen_persists.load(Acquire);
             if persisted < necessary_persists {
                 // it's our responsibility to persist up to our ID
-                let guard = pin();
+                let guard = crossbeam_epoch::pin();
                 let (key, current) = self.get_idgen(&guard)?;
 
                 assert_eq!(current, persisted);
@@ -1896,7 +1905,7 @@ impl PageCache {
 
             let mut cache_infos = StackVec::default();
 
-            let guard = pin();
+            let guard = crossbeam_epoch::pin();
 
             match *state {
                 PageState::Present(ref pointers) => {

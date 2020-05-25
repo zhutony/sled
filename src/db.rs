@@ -95,7 +95,7 @@ impl Db {
         }
 
         // create or open the default tree
-        let guard = pin();
+        let guard = context.pagecache.begin_tx()?;
         let default =
             meta::open_tree(&context, DEFAULT_TREE_ID.to_vec(), &guard)?;
 
@@ -137,7 +137,7 @@ impl Db {
         }
         drop(tenants);
 
-        let guard = pin();
+        let guard = self.context.pagecache.begin_tx()?;
 
         let mut tenants = self.tenants.write();
 
@@ -171,7 +171,7 @@ impl Db {
             return Ok(false);
         };
 
-        let guard = pin();
+        let guard = self.context.pagecache.begin_tx()?;
 
         let mut root_id =
             Some(self.context.pagecache.meta_pid_for_name(name, &guard)?);

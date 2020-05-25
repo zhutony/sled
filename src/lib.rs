@@ -286,9 +286,7 @@ pub use {
         },
         serialization::Serialize,
     },
-    crossbeam_epoch::{
-        pin as crossbeam_pin, Atomic, Guard as CrossbeamGuard, Owned, Shared,
-    },
+    crossbeam_epoch::{pin as crossbeam_pin, Atomic, Guard, Owned, Shared},
 };
 
 pub use self::{
@@ -340,21 +338,17 @@ use {
 };
 
 #[doc(hidden)]
-pub fn pin() -> Guard {
-    Guard { inner: crossbeam_pin(), readset: vec![], writeset: vec![] }
-}
-
-#[doc(hidden)]
-pub struct Guard {
-    inner: CrossbeamGuard,
+pub struct Tx {
+    inner: Guard,
+    ts: u64,
     readset: Vec<PageId>,
     writeset: Vec<PageId>,
 }
 
-impl std::ops::Deref for Guard {
-    type Target = CrossbeamGuard;
+impl std::ops::Deref for Tx {
+    type Target = Guard;
 
-    fn deref(&self) -> &CrossbeamGuard {
+    fn deref(&self) -> &Guard {
         &self.inner
     }
 }

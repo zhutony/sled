@@ -1,6 +1,6 @@
 use std::ops::{Bound, Deref};
 
-use crate::{Guard, Measure, M};
+use crate::{Measure, Tx, M};
 
 use super::*;
 
@@ -37,9 +37,10 @@ macro_rules! iter_try {
 /// An iterator over keys and values in a `Tree`.
 pub struct Iter {
     pub(super) tree: Tree,
+    pub(super) tx: Tx,
     pub(super) hi: Bound<IVec>,
     pub(super) lo: Bound<IVec>,
-    pub(super) cached_node: Option<(PageId, Node, Guard)>,
+    pub(super) cached_node: Option<(PageId, Node)>,
     pub(super) going_forward: bool,
 }
 
@@ -82,17 +83,15 @@ impl Iter {
     }
 
     pub(crate) fn next_inner(&mut self) -> Option<<Self as Iterator>::Item> {
-        let (mut pid, mut node, guard) =
-            if let (true, Some((pid, node, guard))) =
-                (self.going_forward, self.cached_node.take())
-            {
-                (pid, node, guard)
-            } else {
-                let guard = pin();
-                let view =
-                    iter_try!(self.tree.view_for_key(self.low_key(), &guard));
-                (view.pid, view.deref().clone(), guard)
-            };
+        let (mut pid, mut node) = if let (true, Some((pid, node))) =
+            (self.going_forward, self.cached_node.take())
+        {
+            (pid, node)
+        } else {
+            let view =
+                iter_try!(self.tree.view_for_key(self.low_key(), &self.tx));
+            (view.pid, view.deref().clone())
+        };
 
         for _ in 0..MAX_LOOPS {
             if self.bounds_collapsed() {
@@ -104,11 +103,11 @@ impl Iter {
                 let next_pid = node.next?;
                 assert_ne!(pid, next_pid);
                 let view = if let Some(view) =
-                    iter_try!(self.tree.view_for_pid(next_pid, &guard))
+                    iter_try!(self.tree.view_for_pid(next_pid, &self.tx))
                 {
                     view
                 } else {
-                    iter_try!(self.tree.view_for_key(self.low_key(), &guard))
+                    iter_try!(self.tree.view_for_key(self.low_key(), &self.tx))
                 };
 
                 pid = view.pid;
@@ -117,7 +116,8 @@ impl Iter {
             } else if !node.contains_lower_bound(&self.lo, true) {
                 // view too high (maybe split, maybe exhausted?)
                 let seek_key = possible_predecessor(&node.lo)?;
-                let view = iter_try!(self.tree.view_for_key(seek_key, &guard));
+                let view =
+                    iter_try!(self.tree.view_for_key(seek_key, &self.tx));
                 pid = view.pid;
                 node = view.deref().clone();
                 continue;
@@ -125,7 +125,7 @@ impl Iter {
 
             if let Some((key, value)) = node.successor(&self.lo) {
                 self.lo = Bound::Excluded(key.clone());
-                self.cached_node = Some((pid, node, guard));
+                self.cached_node = Some((pid, node));
                 self.going_forward = true;
 
                 match self.hi {
@@ -158,8 +158,7 @@ impl Iterator for Iter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let _measure = Measure::new(&M.tree_scan);
-        let guard = pin();
-        let _ = self.tree.concurrency_control.read(&guard);
+        let _ = self.tree.concurrency_control.read(&self.tx);
         self.next_inner()
     }
 
@@ -171,19 +170,17 @@ impl Iterator for Iter {
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
         let _measure = Measure::new(&M.tree_reverse_scan);
-        let guard = pin();
-        let _ = self.tree.concurrency_control.read(&guard);
+        let _ = self.tree.concurrency_control.read(&self.tx);
 
-        let (mut pid, mut node, guard) =
-            if let (false, Some((pid, node, guard))) =
-                (self.going_forward, self.cached_node.take())
-            {
-                (pid, node, guard)
-            } else {
-                let view =
-                    iter_try!(self.tree.view_for_key(self.high_key(), &guard));
-                (view.pid, view.deref().clone(), guard)
-            };
+        let (mut pid, mut node) = if let (false, Some((pid, node))) =
+            (self.going_forward, self.cached_node.take())
+        {
+            (pid, node)
+        } else {
+            let view =
+                iter_try!(self.tree.view_for_key(self.high_key(), &self.tx));
+            (view.pid, view.deref().clone())
+        };
 
         for _ in 0..MAX_LOOPS {
             if self.bounds_collapsed() {
@@ -195,11 +192,11 @@ impl DoubleEndedIterator for Iter {
                 let next_pid = node.next?;
                 assert_ne!(pid, next_pid);
                 let view = if let Some(view) =
-                    iter_try!(self.tree.view_for_pid(next_pid, &guard))
+                    iter_try!(self.tree.view_for_pid(next_pid, &self.tx))
                 {
                     view
                 } else {
-                    iter_try!(self.tree.view_for_key(self.high_key(), &guard))
+                    iter_try!(self.tree.view_for_key(self.high_key(), &self.tx))
                 };
 
                 pid = view.pid;
@@ -208,7 +205,8 @@ impl DoubleEndedIterator for Iter {
             } else if !node.contains_lower_bound(&self.hi, false) {
                 // view too high (maybe split, maybe exhausted?)
                 let seek_key = possible_predecessor(&node.lo)?;
-                let view = iter_try!(self.tree.view_for_key(seek_key, &guard));
+                let view =
+                    iter_try!(self.tree.view_for_key(seek_key, &self.tx));
                 pid = view.pid;
                 node = view.deref().clone();
                 continue;
@@ -216,7 +214,7 @@ impl DoubleEndedIterator for Iter {
 
             if let Some((key, value)) = node.predecessor(&self.hi) {
                 self.hi = Bound::Excluded(key.clone());
-                self.cached_node = Some((pid, node, guard));
+                self.cached_node = Some((pid, node));
                 self.going_forward = false;
 
                 match self.lo {

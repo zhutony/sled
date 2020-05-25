@@ -191,11 +191,7 @@ impl IoBuf {
     ) -> std::result::Result<Header, Header> {
         debug_delay();
         let res = self.header.compare_and_swap(old, new, SeqCst);
-        if res == old {
-            Ok(new)
-        } else {
-            Err(res)
-        }
+        if res == old { Ok(new) } else { Err(res) }
     }
 }
 
@@ -603,7 +599,8 @@ impl IoBufs {
 
             let header_bytes = header.serialize();
 
-            // initialize the remainder of this buffer (only pad_len of this will be part of the Cap message)
+            // initialize the remainder of this buffer (only pad_len of this
+            // will be part of the Cap message)
             let padding_bytes = vec![
                 MessageKind::Corrupted.into();
                 unused_space - header_bytes.len()
@@ -765,7 +762,7 @@ impl IoBufs {
         // that we never actually free a segment until all threads
         // that may have witnessed a DiskPtr that points into it
         // have completed their (crossbeam-epoch)-pinned operations.
-        let guard = pin();
+        let guard = crossbeam_epoch::pin();
         let max_header_stable_lsn = self.max_header_stable_lsn.clone();
         guard.defer(move || {
             trace!("bumping atomic header lsn to {}", stored_max_stable_lsn);
@@ -1129,7 +1126,7 @@ pub(in crate::pagecache) fn maybe_seal_and_write_iobuf(
 
     let old_arc = unsafe { Arc::from_raw(old_ptr) };
 
-    pin().defer(move || drop(old_arc));
+    crossbeam_epoch::pin().defer(move || drop(old_arc));
 
     // having held the mutex makes this linearized
     // with the notify below.
@@ -1155,7 +1152,8 @@ pub(in crate::pagecache) fn maybe_seal_and_write_iobuf(
                     lsn, e
                 );
 
-                // store error before notifying so that waiting threads will see it
+                // store error before notifying so that waiting threads will see
+                // it
                 iobufs.config.set_global_error(e);
 
                 let intervals = iobufs.intervals.lock();

@@ -71,18 +71,19 @@
 //! assert_eq!(&processed.get(b"k3").unwrap().unwrap(), b"yappin' ligers");
 //! ```
 #![allow(clippy::module_name_repetitions)]
-use std::{cell::RefCell, collections::HashMap, fmt, rc::Rc};
 
-use crate::{pin, Batch, Error, Guard, IVec, Protector, Result, Tree};
+use std::{collections::HashMap, fmt};
+
+use crate::{Batch, Error, IVec, Protector, Result, Tree, Tx};
 
 /// A transaction that will
 /// be applied atomically to the
 /// Tree.
-#[derive(Clone)]
 pub struct TransactionalTree {
     pub(super) tree: Tree,
-    pub(super) writes: Rc<RefCell<HashMap<IVec, Option<IVec>>>>,
-    pub(super) read_cache: Rc<RefCell<HashMap<IVec, Option<IVec>>>>,
+    pub(super) tx: Tx,
+    pub(super) writes: HashMap<IVec, IVec>,
+    pub(super) read_cache: HashMap<IVec, IVec>,
 }
 
 /// An error type that is returned from the closure
@@ -289,9 +290,8 @@ impl TransactionalTree {
         }
 
         // not found in a cache, need to hit the backing db
-        let mut guard = pin();
         let get = loop {
-            if let Ok(get) = self.tree.get_inner(key.as_ref(), &mut guard)? {
+            if let Ok(get) = self.tree.get_inner(key.as_ref(), self.tx)? {
                 break get;
             }
         };
@@ -331,11 +331,12 @@ impl TransactionalTree {
 
     fn commit(&self) -> Result<()> {
         let writes = self.writes.borrow();
-        let mut guard = pin();
         for (k, v_opt) in &*writes {
-            while self.tree.insert_inner(k, v_opt.clone(), &mut guard)?.is_err()
-            {
-            }
+            while self
+                .tree
+                .insert_inner(k, v_opt.clone(), &mut self.tx)?
+                .is_err()
+            {}
         }
         Ok(())
     }
@@ -362,17 +363,17 @@ impl TransactionalTrees {
         tree_idxs.sort_unstable();
 
         let mut last_idx = usize::max_value();
-        let mut all_guards = vec![];
+        let mut all_txs = vec![];
         for (_, idx) in tree_idxs {
             if idx == last_idx {
                 // prevents us from double-locking
                 continue;
             }
             last_idx = idx;
-            let mut guards = self.inner[idx].stage()?;
-            all_guards.append(&mut guards);
+            let mut txs = self.inner[idx].stage()?;
+            all_txs.append(&mut txs);
         }
-        Ok(all_guards)
+        Ok(all_txs)
     }
 
     fn unstage(&self) {
@@ -390,8 +391,8 @@ impl TransactionalTrees {
         true
     }
 
-    fn commit(&self, guard: &Guard) -> Result<()> {
-        let peg = self.inner[0].tree.context.pin_log(guard)?;
+    fn commit(&self, tx: &Tx) -> Result<()> {
+        let peg = self.inner[0].tree.context.pin_log(tx)?;
         for tree in &self.inner {
             tree.commit()?;
         }
@@ -399,7 +400,7 @@ impl TransactionalTrees {
         // when the peg drops, it ensures all updates
         // written to the log since its creation are
         // recovered atomically
-        peg.seal_batch(guard)
+        peg.seal_batch(tx)
     }
 }
 
@@ -449,8 +450,7 @@ pub trait Transactional<E = ()> {
             }
             match ret {
                 Ok(r) => {
-                    let guard = pin();
-                    tt.commit(&guard)?;
+                    tt.commit(&tx)?;
                     return Ok(r);
                 }
                 Err(ConflictableTransactionError::Abort(e)) => {

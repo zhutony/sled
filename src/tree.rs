@@ -131,12 +131,12 @@ impl Tree {
         IVec: From<V>,
     {
         let value = IVec::from(value);
-        let mut guard = pin();
-        let _ = self.concurrency_control.read(&guard);
+        let mut tx = self.context.pagecache.begin_tx()?;
+        let _ = self.concurrency_control.read(&tx);
         loop {
             trace!("setting key {:?}", key.as_ref());
             if let Ok(res) =
-                self.insert_inner(key.as_ref(), Some(value.clone()), &mut guard)?
+                self.insert_inner(key.as_ref(), Some(value.clone()), &mut tx)?
             {
                 return Ok(res);
             }
@@ -147,21 +147,16 @@ impl Tree {
         &self,
         key: &[u8],
         mut value: Option<IVec>,
-        guard: &mut Guard,
+        tx: &mut Tx,
     ) -> Result<Abortable<Option<IVec>>> {
         let _measure = Measure::new(&M.tree_set);
 
         let View { node_view, pid, .. } =
-            self.view_for_key(key.as_ref(), guard)?;
+            self.view_for_key(key.as_ref(), tx)?;
 
         let mut subscriber_reservation = self.subscribers.reserve(&key);
 
         let (encoded_key, last_value) = node_view.node_kv_pair(key.as_ref());
-
-        if value == last_value {
-            // short-circuit a no-op set or delete
-            return Ok(Ok(value))
-        }
 
         let frag = if let Some(value) = value.clone() {
             Link::Set(encoded_key, value)
@@ -173,7 +168,7 @@ impl Tree {
             pid,
             node_view.0,
             frag.clone(),
-            guard,
+            tx,
         )?;
 
         if let Ok(_new_cas_key) = link {
@@ -191,7 +186,7 @@ impl Tree {
                 res.complete(&event);
             }
 
-            guard.writeset.push(pid);
+            tx.writeset.push(pid);
 
             return Ok(Ok(last_value));
         }
@@ -353,24 +348,24 @@ impl Tree {
     /// ```
     pub fn apply_batch(&self, batch: Batch) -> Result<()> {
         let _ = self.concurrency_control.write();
-        let mut guard = pin();
-        self.apply_batch_inner(batch, &mut guard)
+        let mut tx = self.context.pagecache.begin_tx()?;
+        self.apply_batch_inner(batch, &mut tx)
     }
 
     pub(crate) fn apply_batch_inner(
         &self,
         batch: Batch,
-        guard: &mut Guard,
+        tx: &mut Tx,
     ) -> Result<()> {
-        let peg = self.context.pin_log(guard)?;
+        let peg = self.context.pin_log(tx)?;
         for (k, v_opt) in batch.writes {
-            let _old = self.insert_inner(&k, v_opt, guard)?;
+            let _old = self.insert_inner(&k, v_opt, tx)?;
         }
 
         // when the peg drops, it ensures all updates
         // written to the log since its creation are
         // recovered atomically
-        peg.seal_batch(guard)
+        peg.seal_batch(tx)
     }
 
     /// Retrieve a value from the `Tree` if it exists.
@@ -389,10 +384,10 @@ impl Tree {
     /// # Ok(()) }
     /// ```
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
-        let mut guard = pin();
-        let _ = self.concurrency_control.read(&guard);
+        let mut tx = self.context.pagecache.begin_tx()?;
+        let _ = self.concurrency_control.read(&tx);
         loop {
-            if let Ok(get) = self.get_inner(key.as_ref(), &mut guard)? {
+            if let Ok(get) = self.get_inner(key.as_ref(), &mut tx)? {
                 return Ok(get);
             }
         }
@@ -401,18 +396,18 @@ impl Tree {
     pub(crate) fn get_inner(
         &self,
         key: &[u8],
-        guard: &mut Guard,
+        tx: &mut Tx,
     ) -> Result<Abortable<Option<IVec>>> {
         let _measure = Measure::new(&M.tree_get);
 
         trace!("getting key {:?}", key.as_ref());
 
-        let View { node_view, pid, .. } = self.view_for_key(key.as_ref(), guard)?;
+        let View { node_view, pid, .. } = self.view_for_key(key.as_ref(), tx)?;
 
         let pair = node_view.leaf_pair_for_key(key.as_ref());
         let val = pair.map(|kv| kv.1.clone());
 
-        guard.readset.push(pid);
+        tx.readset.push(pid);
 
         Ok(Ok(val))
     }
@@ -437,12 +432,12 @@ impl Tree {
     /// # Ok(()) }
     /// ```
     pub fn remove<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
-        let mut guard = pin();
-        let _ = self.concurrency_control.read(&guard);
+        let mut tx = self.context.pagecache.begin_tx()?;
+        let _ = self.concurrency_control.read(&tx);
         loop {
             trace!("removing key {:?}", key.as_ref());
 
-            if let Ok(res) = self.insert_inner(key.as_ref(), None, &mut guard)? {
+            if let Ok(res) = self.insert_inner(key.as_ref(), None, &mut tx)? {
                 return Ok(res);
             }
         }
@@ -514,8 +509,8 @@ impl Tree {
         trace!("cas'ing key {:?}", key.as_ref());
         let _measure = Measure::new(&M.tree_cas);
 
-        let guard = pin();
-        let _ = self.concurrency_control.read(&guard);
+        let tx = self.context.pagecache.begin_tx()?;
+        let _ = self.concurrency_control.read(&tx);
 
         let new = new.map(IVec::from);
 
@@ -523,7 +518,7 @@ impl Tree {
         // cap fails it doesn't mean our value was changed.
         loop {
             let View { pid, node_view, .. } =
-                self.view_for_key(key.as_ref(), &guard)?;
+                self.view_for_key(key.as_ref(), &tx)?;
 
             let (encoded_key, current_value) =
                 node_view.node_kv_pair(key.as_ref());
@@ -548,7 +543,7 @@ impl Tree {
                 Link::Del(encoded_key)
             };
             let link =
-                self.context.pagecache.link(pid, node_view.0, frag, &guard)?;
+                self.context.pagecache.link(pid, node_view.0, frag, &tx)?;
 
             if link.is_ok() {
                 if let Some(res) = subscriber_reservation.take() {
@@ -862,8 +857,8 @@ impl Tree {
         K: AsRef<[u8]>,
     {
         let _measure = Measure::new(&M.tree_get);
-        let guard = pin();
-        let _ = self.concurrency_control.read(&guard);
+        let tx = self.context.pagecache.begin_tx()?;
+        let _ = self.concurrency_control.read(&tx);
         self.range(..key).next_back().transpose()
     }
 
@@ -919,8 +914,8 @@ impl Tree {
         K: AsRef<[u8]>,
     {
         let _measure = Measure::new(&M.tree_get);
-        let guard = pin();
-        let _ = self.concurrency_control.read(&guard);
+        let tx = self.context.pagecache.begin_tx()?;
+        let _ = self.concurrency_control.read(&tx);
         self.range((ops::Bound::Excluded(key), ops::Bound::Unbounded))
             .next()
             .transpose()
@@ -989,8 +984,8 @@ impl Tree {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let guard = pin();
-        let _ = self.concurrency_control.read(&guard);
+        let tx = self.context.pagecache.begin_tx()?;
+        let _ = self.concurrency_control.read(&tx);
         loop {
             if let Ok(merge) = self.merge_inner(key.as_ref(), value.as_ref())? {
                 return Ok(merge);
@@ -1020,9 +1015,9 @@ impl Tree {
         let merge_operator = merge_operator_opt.as_ref().unwrap();
 
         loop {
-            let guard = pin();
+            let tx = self.context.pagecache.begin_tx()?;
             let View { pid, node_view, .. } =
-                self.view_for_key(key.as_ref(), &guard)?;
+                self.view_for_key(key.as_ref(), &tx)?;
 
             let (encoded_key, current_value) =
                 node_view.node_kv_pair(key.as_ref());
@@ -1038,7 +1033,7 @@ impl Tree {
                 Link::Del(encoded_key)
             };
             let link =
-                self.context.pagecache.link(pid, node_view.0, frag, &guard)?;
+                self.context.pagecache.link(pid, node_view.0, frag, &tx)?;
 
             if link.is_ok() {
                 if let Some(res) = subscriber_reservation.take() {
@@ -1155,7 +1150,7 @@ impl Tree {
     /// assert_eq!(iter.next(), None);
     /// # Ok(()) }
     /// ```
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> Result<Iter> {
         self.range::<Vec<u8>, _>(..)
     }
 
@@ -1190,7 +1185,7 @@ impl Tree {
     /// assert_eq!(r.next(), None);
     /// # Ok(()) }
     /// ```
-    pub fn range<K, R>(&self, range: R) -> Iter
+    pub fn range<K, R>(&self, range: R) -> Result<Iter>
     where
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
@@ -1215,13 +1210,14 @@ impl Tree {
             ops::Bound::Unbounded => ops::Bound::Unbounded,
         };
 
-        Iter {
+        Ok(Iter {
             tree: self.clone(),
+            tx: self.context.pagecache.begin_tx()?,
             hi,
             lo,
             cached_node: None,
             going_forward: true,
-        }
+        })
     }
 
     /// Create an iterator over tuples of keys and values,
@@ -1402,7 +1398,7 @@ impl Tree {
     ///
     /// Note that this is not atomic.
     pub fn clear(&self) -> Result<()> {
-        for k in self.iter().keys() {
+        for k in self.iter()?.keys() {
             let key = k?;
             let _old = self.remove(key)?;
         }
@@ -1421,7 +1417,7 @@ impl Tree {
     /// for the duration of the entire scan.
     pub fn checksum(&self) -> Result<u32> {
         let mut hasher = crc32fast::Hasher::new();
-        let mut iter = self.iter();
+        let mut iter = self.iter()?;
         let _ = self.concurrency_control.write();
         while let Some(kv_res) = iter.next_inner() {
             let (k, v) = kv_res?;
@@ -1436,7 +1432,7 @@ impl Tree {
         view: &View<'g>,
         parent_view: &Option<View<'g>>,
         root_pid: PageId,
-        guard: &'g Guard,
+        tx: &'g Tx,
     ) -> Result<()> {
         trace!("splitting node {}", view.pid);
         // split node
@@ -1444,7 +1440,7 @@ impl Tree {
         let rhs_lo = rhs.lo.clone();
 
         // install right side
-        let (rhs_pid, rhs_ptr) = self.context.pagecache.allocate(rhs, guard)?;
+        let (rhs_pid, rhs_ptr) = self.context.pagecache.allocate(rhs, tx)?;
 
         // replace node, pointing next to installed right
         lhs.next = Some(rhs_pid);
@@ -1452,7 +1448,7 @@ impl Tree {
             view.pid,
             view.node_view.0,
             lhs,
-            guard,
+            tx,
         )?;
         M.tree_child_split_attempt();
         if replace.is_err() {
@@ -1461,7 +1457,7 @@ impl Tree {
             let _new_stack = self
                 .context
                 .pagecache
-                .free(rhs_pid, rhs_ptr, guard)?
+                .free(rhs_pid, rhs_ptr, tx)?
                 .expect("could not free allocated page");
             return Ok(());
         }
@@ -1485,7 +1481,7 @@ impl Tree {
                 parent_view.pid,
                 parent_view.node_view.0,
                 parent,
-                guard,
+                tx,
             )?;
             if replace.is_ok() {
                 M.tree_parent_split_success();
@@ -1495,7 +1491,7 @@ impl Tree {
                 // failed.
             }
         } else {
-            let _ = self.root_hoist(root_pid, rhs_pid, rhs_lo, guard)?;
+            let _ = self.root_hoist(root_pid, rhs_pid, rhs_lo, tx)?;
         }
 
         Ok(())
@@ -1506,7 +1502,7 @@ impl Tree {
         from: PageId,
         to: PageId,
         at: IVec,
-        guard: &'g Guard,
+        tx: &'g Tx,
     ) -> Result<bool> {
         M.tree_root_split_attempt();
         // hoist new root, pointing to lhs & rhs
@@ -1514,7 +1510,7 @@ impl Tree {
         let new_root = Node::new_hoisted_root(from, at, to);
 
         let (new_root_pid, new_root_ptr) =
-            self.context.pagecache.allocate(new_root, guard)?;
+            self.context.pagecache.allocate(new_root, tx)?;
         debug!("allocated pid {} in root_hoist", new_root_pid);
 
         debug_delay();
@@ -1523,7 +1519,7 @@ impl Tree {
             &self.tree_id,
             Some(from),
             Some(new_root_pid),
-            guard,
+            tx,
         )?;
         if cas.is_ok() {
             debug!("root hoist from {} to {} successful", from, new_root_pid);
@@ -1546,7 +1542,7 @@ impl Tree {
             let _new_stack = self
                 .context
                 .pagecache
-                .free(new_root_pid, new_root_ptr, guard)?
+                .free(new_root_pid, new_root_ptr, tx)?
                 .expect("could not free allocated page");
 
             Ok(false)
@@ -1556,16 +1552,16 @@ impl Tree {
     pub(crate) fn view_for_pid<'g>(
         &self,
         pid: PageId,
-        guard: &'g Guard,
+        tx: &'g Tx,
     ) -> Result<Option<View<'g>>> {
         loop {
-            let node_view_opt = self.context.pagecache.get(pid, guard)?;
+            let node_view_opt = self.context.pagecache.get(pid, tx)?;
             // if let Some((tree_ptr, ref leaf, size)) = &frag_opt {
             if let Some(node_view) = &node_view_opt {
                 let size = node_view.0.log_size();
                 let view = View { node_view: *node_view, pid, size };
                 if view.merging_child.is_some() {
-                    self.merge_node(&view, view.merging_child.unwrap(), guard)?;
+                    self.merge_node(&view, view.merging_child.unwrap(), tx)?;
                 } else {
                     return Ok(Some(view));
                 }
@@ -1586,7 +1582,7 @@ impl Tree {
     pub(crate) fn view_for_key<'g, K>(
         &self,
         key: K,
-        guard: &'g Guard,
+        tx: &'g Tx,
     ) -> Result<View<'g>>
     where
         K: AsRef<[u8]>,
@@ -1627,7 +1623,7 @@ impl Tree {
                 return Err(Error::CollectionNotFound(self.tree_id.clone()));
             }
 
-            let node_opt = self.view_for_pid(cursor, guard)?;
+            let node_opt = self.view_for_pid(cursor, tx)?;
 
             let view = if let Some(view) = node_opt {
                 view
@@ -1637,7 +1633,7 @@ impl Tree {
 
             // When we encounter a merge intention, we collaboratively help out
             if view.merging_child.is_some() {
-                self.merge_node(&view, view.merging_child.unwrap(), guard)?;
+                self.merge_node(&view, view.merging_child.unwrap(), tx)?;
                 retry!();
             } else if view.merging {
                 // we missed the parent merge intention due to a benign race,
@@ -1655,7 +1651,7 @@ impl Tree {
             }
 
             if view.should_split() {
-                self.split_node(&view, &parent_view, root_pid, guard)?;
+                self.split_node(&view, &parent_view, root_pid, tx)?;
                 retry!();
             }
 
@@ -1675,7 +1671,7 @@ impl Tree {
                         root_pid,
                         view.next.unwrap(),
                         view.hi.clone(),
-                        guard,
+                        tx,
                     )? {
                         M.tree_root_split_success();
                         retry!();
@@ -1702,7 +1698,7 @@ impl Tree {
                     unsplit_parent.pid,
                     unsplit_parent.node_view.0,
                     parent,
-                    guard,
+                    tx,
                 )?;
                 if replace.is_ok() {
                     M.tree_parent_split_success();
@@ -1726,12 +1722,12 @@ impl Tree {
                             parent.pid,
                             parent.node_view.0,
                             frag,
-                            guard,
+                            tx,
                         )?;
 
                         if let Ok(new_parent_ptr) = link {
                             parent.node_view = NodeView(new_parent_ptr);
-                            self.merge_node(parent, cursor, guard)?;
+                            self.merge_node(parent, cursor, tx)?;
                             retry!();
                         }
                     }
@@ -1758,13 +1754,13 @@ impl Tree {
     fn cap_merging_child<'g>(
         &'g self,
         child_pid: PageId,
-        guard: &'g Guard,
+        tx: &'g Tx,
     ) -> Result<Option<View<'g>>> {
         // Get the child node and try to install a `MergeCap` frag.
         // In case we succeed, we break, otherwise we try from the start.
         loop {
             let mut child_view = if let Some(child_view) =
-                self.view_for_pid(child_pid, guard)?
+                self.view_for_pid(child_pid, tx)?
             {
                 child_view
             } else {
@@ -1782,7 +1778,7 @@ impl Tree {
                 child_pid,
                 child_view.node_view.0,
                 Link::ChildMergeCap,
-                guard,
+                tx,
             )?;
             match install_frag {
                 Ok(new_ptr) => {
@@ -1809,7 +1805,7 @@ impl Tree {
         &self,
         parent_view: &View<'g>,
         child_pid: PageId,
-        guard: &'g Guard,
+        tx: &'g Tx,
     ) -> Result<bool> {
         let mut parent_view = Cow::Borrowed(parent_view);
         loop {
@@ -1817,7 +1813,7 @@ impl Tree {
                 parent_view.pid,
                 parent_view.node_view.0,
                 Link::ParentMergeConfirm,
-                guard,
+                tx,
             )?;
             match linked {
                 Ok(_) => {
@@ -1839,7 +1835,7 @@ impl Tree {
                 }
                 Err(_) => {
                     let new_parent_view = if let Some(new_parent_view) =
-                        self.view_for_pid(parent_view.pid, guard)?
+                        self.view_for_pid(parent_view.pid, tx)?
                     {
                         trace!(
                             "failed to confirm merge \
@@ -1877,7 +1873,7 @@ impl Tree {
         &self,
         parent_view: &View<'g>,
         child_pid: PageId,
-        guard: &'g Guard,
+        tx: &'g Tx,
     ) -> Result<()> {
         trace!(
             "merging child pid {} of parent pid {}",
@@ -1886,7 +1882,7 @@ impl Tree {
         );
 
         let child_view = if let Some(merging_child) =
-            self.cap_merging_child(child_pid, guard)?
+            self.cap_merging_child(child_pid, tx)?
         {
             merging_child
         } else {
@@ -1920,7 +1916,7 @@ impl Tree {
                 cursor_pid
             );
             let cursor_view = if let Some(cursor_view) =
-                self.view_for_pid(cursor_pid, guard)?
+                self.view_for_pid(cursor_pid, tx)?
             {
                 cursor_view
             } else {
@@ -1961,7 +1957,7 @@ impl Tree {
                     cursor_pid,
                     cursor_node.0,
                     replacement,
-                    guard,
+                    tx,
                 )?;
                 match replace {
                     Ok(_) => {
@@ -2031,7 +2027,7 @@ impl Tree {
         );
 
         let should_continue =
-            self.install_parent_merge(parent_view, child_pid, guard)?;
+            self.install_parent_merge(parent_view, child_pid, tx)?;
 
         if !should_continue {
             return Ok(());
@@ -2040,7 +2036,7 @@ impl Tree {
         match self.context.pagecache.free(
             child_pid,
             child_view.node_view.0,
-            guard,
+            tx,
         )? {
             Ok(_) => {
                 // we freed it
@@ -2076,12 +2072,12 @@ impl Tree {
         &self,
         mut leftmost_chain: Vec<PageId>,
     ) -> Result<()> {
-        let guard = pin();
+        let tx = self.context.pagecache.begin_tx()?;
 
         while let Some(mut pid) = leftmost_chain.pop() {
             loop {
                 let cursor_view =
-                    if let Some(view) = self.view_for_pid(pid, &guard)? {
+                    if let Some(view) = self.view_for_pid(pid, &tx)? {
                         view
                     } else {
                         trace!("encountered Free node while GC'ing tree");
@@ -2091,7 +2087,7 @@ impl Tree {
                 let ret = self.context.pagecache.free(
                     pid,
                     cursor_view.node_view.0,
-                    &guard,
+                    &tx,
                 )?;
 
                 if ret.is_ok() {
@@ -2115,7 +2111,12 @@ impl Debug for Tree {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> std::result::Result<(), fmt::Error> {
-        let guard = pin();
+        let tx = Tx {
+            inner: crossbeam_epoch::pin(),
+            writeset: vec![],
+            readset: vec![],
+            ts: 0,
+        };
 
         let mut pid = self.root.load(SeqCst);
         let mut left_most = pid;
@@ -2126,7 +2127,7 @@ impl Debug for Tree {
         f.write_str("\tlevel 0:\n")?;
 
         loop {
-            let get_res = self.view_for_pid(pid, &guard);
+            let get_res = self.view_for_pid(pid, &tx);
             let node = if let Ok(Some(ref view)) = get_res {
                 view.deref()
             } else {
@@ -2146,7 +2147,7 @@ impl Debug for Tree {
                 pid = next_pid;
             } else {
                 // we've traversed our level, time to bump down
-                let left_get_res = self.view_for_pid(left_most, &guard);
+                let left_get_res = self.view_for_pid(left_most, &tx);
                 let left_node = if let Ok(Some(ref view)) = left_get_res {
                     view
                 } else {
