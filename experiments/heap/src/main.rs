@@ -68,8 +68,9 @@ struct Page {
     // [header | key lengths | value lengths | keys | values]
     //
     // header: {
-    //  is leaf: 1 bit,
-    //  number of children: 15 bits,
+    //  is leaf: 1 byte,
+    //  number of children: 3 bytes,
+    //  key length sum: 4 bytes
     data: [u8],
 }
 
@@ -83,30 +84,35 @@ struct PageView<'a> {
     values: &'a [&'a [u8]],
 }
 
-const LEAF_MASK: u8 = 0b1111_1110;
-
 impl Page {
     const fn view(&self) -> PageView<'_> {
-        let is_leaf = self.data[0] ^ LEAF_MASK != 0;
+        let is_leaf = self.data[0] == 0;
 
         // does not account for lo and hi keys
         let child_count =
-            u16::from_le_bytes([self.data[0] & LEAF_MASK, self.data[1]])
+            u32::from_le_bytes([self.data[1], self.data[2], self.data[3], 0])
                 as usize;
 
-        let key_length_base = self.data.as_ptr().add(2);
-        let val_length_base = key_length_base.add((2 * 2) + (child_count * 2));
-        let keys_base = val_length_base.add(child_count * 4);
+        let key_length_sum = u32::from_le_bytes([
+            self.data[4],
+            self.data[5],
+            self.data[6],
+            self.data[7],
+        ]) as usize;
 
-        let key_lengths: &[u16] = unsafe {
-            std::mem::transmute((key_length_base as *mut u16, child_count + 2))
+        let key_length_base = unsafe { self.data.as_ptr().add(5) };
+        let val_length_base =
+            unsafe { key_length_base.add((2 * 8) + (child_count * 8)) };
+        let keys_base = unsafe { val_length_base.add(child_count * 8) };
+        let val_base = unsafe { keys_base.add(key_length_sum) };
+
+        let key_lengths: &[u64] = unsafe {
+            std::mem::transmute((key_length_base as *mut u64, child_count + 2))
         };
 
-        let val_lengths: &[u32] = unsafe {
-            std::mem::transmute((val_length_base as *mut u32, child_count))
+        let val_lengths: &[u64] = unsafe {
+            std::mem::transmute((val_length_base as *mut u64, child_count))
         };
-
-        let val_base = keys_base.add(key_lengths.iter().sum::<u16>() as usize);
 
         let lo_len = key_lengths[0] as usize;
         let hi_len = key_lengths[1] as usize;
@@ -116,14 +122,7 @@ impl Page {
         let keys = &[];
         let values = &[];
 
-        PageView {
-            is_leaf,
-            child_count,
-            hi,
-            lo,
-            keys,
-            values,
-        }
+        PageView { is_leaf, child_count, hi, lo, keys, values }
     }
 
     /*
