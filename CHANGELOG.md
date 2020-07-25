@@ -1,3 +1,18 @@
+# 0.34
+
+## Improvements
+
+* #1132 implemented From<sled::Error> for io::Error to
+  reduce friction in some situations.
+
+## Breaking Changes
+
+* #1131 transactions performed on `Tree`s from different
+  `Db`s will now safely fail.
+* #1131 transactions may now only be performed on tuples
+  of up to 14 elements. For higher numbers, please use
+  slices.
+
 # 0.33
 
 ## Breaking Changes
